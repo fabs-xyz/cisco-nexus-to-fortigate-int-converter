@@ -1,22 +1,63 @@
+import argparse
 import copy
 import os
 import re
+import sys
 
 # IPv4 regex: matches IPv4 patterns only (no adjacent digits)
-IP_RE = re.compile(r'(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)')
+IP_RE = re.compile(r'(?<!\d)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?!\d)')
+
+
+def validate_ipv4(ip: str) -> bool:
+    """Return True if *ip* is a valid IPv4 address (each octet 0-255)."""
+    parts = ip.split('.')
+    if len(parts) != 4:
+        return False
+    try:
+        return all(0 <= int(p) <= 255 for p in parts)
+    except ValueError:
+        return False
+
+
+def _ip_str(ip: str, mask: str) -> str:
+    """Format an IP + mask as either 'a.b.c.d e.f.g.h' or 'a.b.c.d/prefix'."""
+    if '.' in mask:
+        return f"{ip} {mask}"
+    return f"{ip}/{mask}"
 
 
 def parse_cisco_interface(input_path: str):
+    """Parse a Cisco Nexus interface config file and return a list of interface dicts.
+
+    Each dict contains:
+      vlan_id          – VLAN number (string)
+      ip_address       – primary IPv4 address (string, optional)
+      subnet_mask      – mask in dotted or CIDR prefix form (string, optional)
+      description      – interface description truncated to 25 chars (string, optional)
+      dhcp_relay_exists – True when DHCP relay addresses were found (bool)
+      dhcp_relay_list  – list of relay server IPs (list of str)
+      secondary_list   – list of secondary IPv4 addresses, each as
+                         {'ip': str, 'mask': str} (list of dict)
+    """
+    if not os.path.isfile(input_path):
+        print(f"Error: input file not found: {input_path}", file=sys.stderr)
+        sys.exit(1)
+
     print('Starting parse...')
     interface_dict_list = []
     interface_dict = None
-    pending_dhcp_relay = False  # Marker in case "ip dhcp relay address" is wrapped and the IPs are on the next line
+    # Marker: previous line was "ip dhcp relay address" without trailing IPs
+    pending_dhcp_relay = False
 
     with open(input_path, encoding='utf-8') as f:
-        for line in f.readlines():
+        for line in f:
             stripped = line.strip()
 
-            # End of block (legacy NX-OS style)
+            # Skip blank lines
+            if not stripped:
+                continue
+
+            # End of block (legacy NX-OS style uses "!" as separator)
             if stripped.startswith("!"):
                 if interface_dict:
                     interface_dict_list.append(copy.deepcopy(interface_dict))
@@ -24,219 +65,213 @@ def parse_cisco_interface(input_path: str):
                 pending_dhcp_relay = False
                 continue
 
-            # New interface starts
+            # New interface block starts
             if stripped.startswith("interface"):
                 if interface_dict:
                     interface_dict_list.append(copy.deepcopy(interface_dict))
-                interface_dict = {'dhcp_relay_list': [], 'dhcp_relay_exists': False}
+                interface_dict = {
+                    'dhcp_relay_list': [],
+                    'dhcp_relay_exists': False,
+                    'secondary_list': [],
+                }
                 pending_dhcp_relay = False
                 parts = stripped.split()
-                if len(parts) > 1 and parts[0] == "interface":
+                if len(parts) >= 2:
                     vlan_id = parts[1].replace("Vlan", "")
                     interface_dict['vlan_id'] = vlan_id
+                continue
 
-            elif interface_dict is not None:
-                # If the previous line was "ip dhcp relay address" without IPs, expect continuation line here
-                if pending_dhcp_relay:
-                    ips = IP_RE.findall(stripped)
-                    if ips:
-                        interface_dict['dhcp_relay_exists'] = True
-                        interface_dict['dhcp_relay_list'].extend(ips)
-                        pending_dhcp_relay = False
-                    # no "continue": this line may also carry other info
+            # Lines outside any interface block (e.g. the parent interface name)
+            if interface_dict is None:
+                continue
 
-                if stripped.startswith("description"):
-                    desc = stripped.replace("description", "").strip()
-                    # Alias up to 25 characters
-                    interface_dict['description'] = desc[:25]
-
-                elif stripped.startswith("ip address"):
-                    if stripped == "no ip address":
-                        continue
-                    if "/" in stripped:
-                        # New syntax with CIDR
-                        try:
-                            ip, mask = stripped.split()[2].split("/")
-                            interface_dict['ip_address'] = ip
-                            interface_dict['subnet_mask'] = mask
-                        except Exception:
-                            pass
-                    else:
-                        # Legacy syntax with dotted mask
-                        parts = stripped.split()
-                        if len(parts) >= 4:
-                            interface_dict['ip_address'] = parts[2]
-                            interface_dict['subnet_mask'] = parts[3]
-
-                elif stripped.startswith("ip helper-address") or stripped.startswith("ip dhcp relay address"):
-                    # Grab all IPv4s from the (possibly wrapped) line
-                    ips = IP_RE.findall(stripped)
-                    if ips:
-                        interface_dict['dhcp_relay_exists'] = True
-                        interface_dict['dhcp_relay_list'].extend(ips)
-                        pending_dhcp_relay = False
-                    else:
-                        # Example:
-                        # ip dhcp relay address
-                        #   10.1.1.10 10.1.1.20
-                        pending_dhcp_relay = True
-
-                elif stripped.startswith("standby"):
-                    # Legacy HSRP syntax
-                    parts = stripped.split()
-                    try:
-                        if parts[2] == "ip":
-                            interface_dict['ip_address'] = parts[3]
-                    except IndexError:
-                        pass
-
-                elif stripped.startswith("hsrp"):
-                    # New HSRP block syntax – ignore details
+            # Continuation line after a bare "ip dhcp relay address" (no IPs on that line)
+            if pending_dhcp_relay:
+                ips = [ip for ip in IP_RE.findall(stripped) if validate_ipv4(ip)]
+                if ips:
+                    interface_dict['dhcp_relay_exists'] = True
+                    interface_dict['dhcp_relay_list'].extend(ips)
+                    pending_dhcp_relay = False
                     continue
 
-                elif " ip " in stripped and "hsrp" not in stripped:
-                    # Try to catch secondary IP or normal IP lines
-                    parts = stripped.split()
-                    if len(parts) > 1 and "." in parts[1]:
-                        if len(parts) > 2 and parts[2] == "secondary":
-                            interface_dict['secondary'] = parts[1]
-                        else:
-                            interface_dict['ip_address'] = parts[1]
+            if stripped.startswith("description"):
+                desc = stripped[len("description"):].strip()
+                # FortiGate alias is limited to 25 characters
+                interface_dict['description'] = desc[:25]
 
-        # Save the last interface
-        if interface_dict:
-            interface_dict_list.append(interface_dict)
+            elif stripped == "no ip address":
+                # Clears the IP — nothing to store
+                pass
+
+            elif stripped.startswith("ip address"):
+                parts = stripped.split()
+                is_secondary = 'secondary' in parts
+                try:
+                    raw = parts[2]  # either "a.b.c.d" or "a.b.c.d/prefix"
+                    if '/' in raw:
+                        ip, mask = raw.split('/', 1)
+                    else:
+                        ip = raw
+                        mask = parts[3] if len(parts) >= 4 else ''
+                    if validate_ipv4(ip) and mask:
+                        if is_secondary:
+                            interface_dict['secondary_list'].append({'ip': ip, 'mask': mask})
+                        else:
+                            interface_dict['ip_address'] = ip
+                            interface_dict['subnet_mask'] = mask
+                except (IndexError, ValueError):
+                    pass
+
+            elif stripped.startswith("ip helper-address") or stripped.startswith("ip dhcp relay address"):
+                ips = [ip for ip in IP_RE.findall(stripped) if validate_ipv4(ip)]
+                if ips:
+                    interface_dict['dhcp_relay_exists'] = True
+                    interface_dict['dhcp_relay_list'].extend(ips)
+                else:
+                    # IPs may be on the next continuation line, e.g.:
+                    #   ip dhcp relay address
+                    #     10.1.1.10 10.1.1.20
+                    pending_dhcp_relay = True
+
+            elif stripped.startswith("standby"):
+                # Legacy HSRP syntax: standby <group> ip <IP> [secondary]
+                parts = stripped.split()
+                try:
+                    if parts[2] == "ip" and validate_ipv4(parts[3]):
+                        is_secondary = len(parts) > 4 and parts[4] == "secondary"
+                        mask = interface_dict.get('subnet_mask', '')
+                        if is_secondary:
+                            interface_dict['secondary_list'].append({'ip': parts[3], 'mask': mask})
+                        elif 'ip_address' not in interface_dict:
+                            # Only use HSRP virtual IP when no real IP has been parsed yet
+                            interface_dict['ip_address'] = parts[3]
+                except IndexError:
+                    pass
+
+            elif stripped.startswith("hsrp"):
+                # NX-OS inline HSRP syntax: hsrp <group> ipv4 <IP>
+                parts = stripped.split()
+                if len(parts) >= 4 and validate_ipv4(parts[3]):
+                    if 'ip_address' not in interface_dict:
+                        interface_dict['ip_address'] = parts[3]
+
+    # Save the last interface block (no trailing "!" in some configs)
+    if interface_dict:
+        interface_dict_list.append(interface_dict)
 
     print(f"Detected {len(interface_dict_list)} interfaces.")
     return interface_dict_list
 
 
 def _render_dhcp_relay_list(dhcp_list):
-    """Build quoted list for FortiOS output."""
-    # Clean IPs (trim whitespace/quotes) and join with quotes
-    return ' '.join('"{}"'.format(str(ip).strip().strip('"')) for ip in dhcp_list)
+    """Build a space-separated quoted list of DHCP relay IPs for FortiOS."""
+    return ' '.join('"' + str(ip).strip().strip('"') + '"' for ip in dhcp_list)
 
 
-def config_dhcp_relay(interface_dict: dict, interface_name: str) -> str:
-    try:
-        if '.' in interface_dict['subnet_mask']:
-            # Legacy syntax with dotted mask
-            config = f"""
-            edit "VL.{interface_dict['vlan_id']}"
-                set vdom "root"
-                set dhcp-relay-service enable
-                set ip {interface_dict['ip_address']} {interface_dict['subnet_mask']}
-                set allowaccess ping
-                set status down
-                set alias "{interface_dict.get('description', '')}"
-                set device-identification enable
-                set role lan
-                set dhcp-relay-ip {_render_dhcp_relay_list(interface_dict['dhcp_relay_list'])}
-                set dhcp-relay-request-all-server enable
-                set interface "{interface_name}"
-                set vlanid {interface_dict['vlan_id']}
-            next
-            """
-        else:
-            # New syntax with CIDR
-            config = f"""
-            edit "VL.{interface_dict['vlan_id']}"
-                set vdom "root"
-                set dhcp-relay-service enable
-                set ip {interface_dict['ip_address']}/{interface_dict['subnet_mask']}
-                set allowaccess ping
-                set status down
-                set alias "{interface_dict.get('description', '')}"
-                set device-identification enable
-                set role lan
-                set dhcp-relay-ip {_render_dhcp_relay_list(interface_dict['dhcp_relay_list'])}
-                set dhcp-relay-request-all-server enable
-                set interface "{interface_name}"
-                set vlanid {interface_dict['vlan_id']}
-            next
-            """
-    except Exception as e:
-        print(f"Skipping interface with DHCP relay VLAN {interface_dict.get('vlan_id', 'unknown')}: {e}")
-        config = ''
-    return config
+def _render_interface_block(interface_dict: dict, interface_name: str) -> str:
+    """Render a single FortiGate 'edit … next' block for one VLAN interface."""
+    vlan_id = interface_dict.get('vlan_id', 'unknown')
+    ip = interface_dict.get('ip_address', '')
+    mask = interface_dict.get('subnet_mask', '')
+    description = interface_dict.get('description', '')
+    dhcp_relay_exists = interface_dict.get('dhcp_relay_exists', False)
+    dhcp_relay_list = interface_dict.get('dhcp_relay_list', [])
+    secondary_list = interface_dict.get('secondary_list', [])
+
+    if not ip or not mask:
+        print(f"  Skipping VLAN {vlan_id}: missing IP address or subnet mask.")
+        return ''
+
+    lines = [
+        f'edit "VL.{vlan_id}"',
+        '    set vdom "root"',
+    ]
+
+    if dhcp_relay_exists:
+        lines.append('    set dhcp-relay-service enable')
+
+    lines.append(f'    set ip {_ip_str(ip, mask)}')
+    lines.append('    set allowaccess ping')
+    lines.append('    set status down')
+
+    if description:
+        lines.append(f'    set alias "{description}"')
+
+    lines.append('    set device-identification enable')
+    lines.append('    set role lan')
+
+    if dhcp_relay_exists:
+        lines.append(f'    set dhcp-relay-ip {_render_dhcp_relay_list(dhcp_relay_list)}')
+        lines.append('    set dhcp-relay-request-all-server enable')
+
+    lines.append(f'    set interface "{interface_name}"')
+    lines.append(f'    set vlanid {vlan_id}')
+
+    if not dhcp_relay_exists and secondary_list:
+        lines.append('    set secondary-IP enable')
+        lines.append('    config secondaryip')
+        for idx, sec in enumerate(secondary_list, start=1):
+            sec_mask = sec.get('mask') or mask  # fall back to primary mask
+            lines.append(f'        edit {idx}')
+            lines.append(f'            set ip {_ip_str(sec["ip"], sec_mask)}')
+            lines.append('            set allowaccess ping')
+            lines.append('        next')
+        lines.append('    end')
+
+    lines.append('next')
+    return '\n'.join(lines) + '\n'
 
 
-def config_no_dhcp_relay(interface_dict: dict, interface_name: str) -> str:
-    try:
-        if '.' in interface_dict['subnet_mask']:
-            # Legacy syntax with dotted mask
-            config = f"""
-            edit "VL.{interface_dict['vlan_id']}"
-                set vdom "root"
-                set ip {interface_dict['ip_address']} {interface_dict['subnet_mask']}
-                set allowaccess ping
-                set status down
-                set alias "{interface_dict.get('description', '')}"
-                set device-identification enable
-                set role lan
-                set interface "{interface_name}"
-                set vlanid {interface_dict['vlan_id']}
-            """
-            if 'secondary' in interface_dict.keys():
-                config += f"""
-                set secondary-IP enable
-                    config secondaryip
-                        edit 1
-                            set ip {interface_dict['secondary']} {interface_dict['subnet_mask']}
-                            set allowaccess ping
-                        next
-                    end
-                """
-            config += 'next\n'
-        else:
-            # New syntax with CIDR
-            config = f"""
-            edit "VL.{interface_dict['vlan_id']}"
-                set vdom "root"
-                set ip {interface_dict['ip_address']}/{interface_dict['subnet_mask']}
-                set allowaccess ping
-                set status down
-                set alias "{interface_dict.get('description', '')}"
-                set device-identification enable
-                set role lan
-                set interface "{interface_name}"
-                set vlanid {interface_dict['vlan_id']}
-            """
-            if 'secondary' in interface_dict.keys():
-                config += f"""
-                set secondary-IP enable
-                    config secondaryip
-                        edit 1
-                            set ip {interface_dict['secondary']}/{interface_dict['subnet_mask']}
-                            set allowaccess ping
-                        next
-                    end
-                """
-            config += 'next\n'
-    except Exception as e:
-        print(f"Skipping interface without DHCP relay VLAN {interface_dict.get('vlan_id', 'unknown')}: {e}")
-        config = ''
-    return config
-
-
-def create_forti_interface(interface_dict_list: list, interface_name: str):
-    os.makedirs('output', exist_ok=True)
-    with open('output/forti_config.txt', 'w+', encoding='utf-8') as f:
+def create_forti_interface(interface_dict_list: list, interface_name: str,
+                           output_path: str = 'output/forti_config.txt'):
+    """Write the FortiGate 'config system interface' block to *output_path*."""
+    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write('config system interface\n')
         for interface_dict in interface_dict_list:
             print(f"Processing VLAN {interface_dict.get('vlan_id', 'unknown')}")
-            if interface_dict.get('dhcp_relay_exists'):
-                config = config_dhcp_relay(interface_dict, interface_name)
-                f.write(config)
-            else:
-                config = config_no_dhcp_relay(interface_dict, interface_name)
-                f.write(config)
-    print("Configuration successfully created → output/forti_config.txt")
+            block = _render_interface_block(interface_dict, interface_name)
+            if block:
+                f.write(block)
+        f.write('end\n')
+    print(f"Configuration successfully created → {output_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Convert Cisco Nexus interface config to FortiGate CLI syntax.'
+    )
+    parser.add_argument(
+        '--input', '-i',
+        default='input/input_nexus.txt',
+        help='Path to the Cisco Nexus input file (default: input/input_nexus.txt). '
+             'The first line of this file is used as the FortiGate parent interface name '
+             '(e.g. "ae1") unless --interface is specified.',
+    )
+    parser.add_argument(
+        '--output', '-o',
+        default='output/forti_config.txt',
+        help='Path for the generated FortiGate config file (default: output/forti_config.txt).',
+    )
+    parser.add_argument(
+        '--interface', '-n',
+        default=None,
+        help='FortiGate parent interface / LAG name (e.g. "ae1"). '
+             'Overrides the first line of the input file.',
+    )
+    args = parser.parse_args()
+
+    parsed_info = parse_cisco_interface(args.input)
+
+    if args.interface:
+        interface_name = args.interface
+    else:
+        with open(args.input, encoding='utf-8') as f:
+            interface_name = f.readline().strip()
+
+    create_forti_interface(parsed_info, interface_name=interface_name,
+                           output_path=args.output)
 
 
 if __name__ == '__main__':
-    input_file = 'input/input_nexus.txt'
-    parsed_info = parse_cisco_interface(input_file)
-    # First line = uplink
-    with open(input_file, encoding='utf-8') as f:
-        lacp_name = f.readline().strip()
-    create_forti_interface(parsed_info, interface_name=lacp_name)
+    main()

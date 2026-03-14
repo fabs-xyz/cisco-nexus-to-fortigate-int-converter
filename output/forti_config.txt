@@ -1,28 +1,34 @@
-
-            edit "VL.10"
-                set vdom "root"
-                set ip 192.168.10.200 255.255.255.0
-                set allowaccess ping
-                set status down
-                set alias "Corp LAN"
-                set device-identification enable
-                set role lan
-                set interface "ae1"
-                set vlanid 10
-            next
-
-            edit "VL.20"
-                set vdom "root"
-                set dhcp-relay-service enable
-                set ip 10.20.0.1/24
-                set allowaccess ping
-                set status down
-                set alias "DMZ"
-                set device-identification enable
-                set role lan
-                set dhcp-relay-ip "10.1.1.10" "10.1.1.20"
-                set dhcp-relay-request-all-server enable
-                set interface "ae1"
-                set vlanid 20
-            next
-            
+config system interface
+edit "VL.12"
+    set vdom "root"
+    set dhcp-relay-service enable
+    set ip 192.168.178.2/24
+    set allowaccess ping
+    set status down
+    set alias "192.168.178__House"
+    set device-identification enable
+    set role lan
+    set dhcp-relay-ip "192.168.178.80"
+    set dhcp-relay-request-all-server enable
+    set interface "ae1"
+    set vlanid 12
+next
+edit "VL.10"
+    set vdom "root"
+    set ip 10.0.0.1/24
+    set allowaccess ping
+    set status down
+    set alias "Corp LAN"
+    set device-identification enable
+    set role lan
+    set interface "ae1"
+    set vlanid 10
+    set secondary-IP enable
+    config secondaryip
+        edit 1
+            set ip 10.0.0.254/24
+            set allowaccess ping
+        next
+    end
+next
+end

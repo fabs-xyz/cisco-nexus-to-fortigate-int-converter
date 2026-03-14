@@ -1,16 +1,11 @@
 ae1
+interface Vlan12
+ description 192.168.178__House
+ ip address 192.168.178.2/24
+ ip dhcp relay address 192.168.178.80
+!
 interface Vlan10
  description Corp LAN
- ip address 192.168.10.1 255.255.255.0
- ip address 192.168.10.254 255.255.255.0 secondary
- standby 1 ip 192.168.10.200
+ ip address 10.0.0.1/24
+ ip address 10.0.0.254/24 secondary
 !
-interface Vlan20
- description DMZ
- ip address 10.20.0.1/24
- ip helper-address 10.1.1.10
- ip helper-address 10.1.1.20
-!
-interface Vlan30
- ip dhcp relay address
-  10.2.2.1 10.2.2.2
