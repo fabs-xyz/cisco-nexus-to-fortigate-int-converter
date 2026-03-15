@@ -1,0 +1,11 @@
+ae1
+interface Vlan12
+ description 192.168.178__House
+ ip address 192.168.178.2/24
+ ip dhcp relay address 192.168.178.80
+!
+interface Vlan10
+ description Corp LAN
+ ip address 10.0.0.1/24
+ ip address 10.0.0.254/24 secondary
+!
